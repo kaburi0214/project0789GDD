@@ -1,0 +1,204 @@
+# 当前脚本应该在01_project0789目录下，而不是在分析点目录08_2050pred里面
+# 清除当前环境所有变量并返回内存使用情况
+rm(list = ls()); gc()
+
+# 定义两个变量,output和ORIGINAL_DIR
+ORIGINAL_DIR <- "/data/nas1/zhangtongrui_OD/project/01_project0789"
+output <- file.path(ORIGINAL_DIR, "08_2050pred")
+
+# 确保输出目录存在
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+# 切换到项目目录下
+setwd(ORIGINAL_DIR)
+
+# 加载必要的包
+library(segmented)
+library(forecast)
+library(tseries)
+library(dplyr)
+library(ggplot2)
+
+# 加载数据集
+gbd_32 <- read.csv("00_rawdata/IHME-GBD_2021_DATA-ec7daba0-1.csv")
+
+# 全球年龄标准化率数据
+global_data <- gbd_32 %>%
+  filter(
+    location_name == "Global",
+    age_name == "Age-standardized", 
+    sex_name == "Both",
+    metric_name == "Rate"
+  ) %>%
+  arrange(year) %>%
+  dplyr::select(measure_name, year, val, upper, lower)
+
+# 为每个指标准备数据
+measures <- unique(global_data$measure_name)
+
+global_data <- global_data %>%
+  group_by(measure_name) %>%
+  mutate(trend = predict(lm(val ~ year))) %>%
+  ungroup()
+
+# Joinpoint + ARIMA分析
+arima_results_joinpoint <- list()
+
+for(measure in measures) {
+  # 提取单个指标数据
+  measure_data <- global_data %>%
+    filter(measure_name == measure)
+  
+  # Joinpoint分析
+  # 对数变换用于计算APC
+  measure_data$log_val <- log(measure_data$val)
+  
+  # 线性回归作为基础
+  lm_model <- lm(log_val ~ year, data = measure_data)
+  
+  # 尝试分段回归
+  tryCatch({
+    # 尝试1个断点
+    seg_model <- segmented(lm_model, seg.Z = ~year, npsi = 1)
+    # 使用分段模型的最后一段斜率来调整数据
+    # 获取最后一段的斜率
+    slopes <- slope(seg_model)
+    last_slope <- slopes$year[nrow(slopes$year), 1]
+    breakpoint <- seg_model$psi[,"Est."]
+    
+    # 基于最后一段趋势调整2020-2021年的异常值（考虑到可能由以COVID-19为主等原因造成的结构性断点）
+    recent_years <- which(measure_data$year >= breakpoint)
+    if(length(recent_years) > 2) {
+      # 使用最后一段的线性趋势来平滑最近几年的数据
+      recent_data <- measure_data[recent_years, ]
+      recent_trend <- lm(val ~ year, data = recent_data[1:(length(recent_years)-2), ])
+      
+      # 用趋势值替换最后2年的异常值
+      predicted_vals <- predict(recent_trend, newdata = measure_data[recent_years, ])
+      measure_data$val_adjusted <- measure_data$val
+      measure_data$val_adjusted[recent_years[(length(recent_years)-1):length(recent_years)]] <- 
+        predicted_vals[(length(predicted_vals)-1):length(predicted_vals)]
+    } else {
+      measure_data$val_adjusted <- measure_data$val
+    }
+    
+  }, error = function(e) {
+  
+    measure_data$val_adjusted <- measure_data$val
+  })
+  
+  # 基于1990年-2021年的数据进行ARIMA建模
+  ts_data <- ts(measure_data$val_adjusted, start = 1990, end = 2021, frequency = 1)
+  
+  # 构建ARIMA模型
+  arima_model <- auto.arima(ts_data)
+  
+  # 预测到2050年
+  forecast_result <- forecast(arima_model, h = 29)
+  
+  # 保存结果
+  arima_results_joinpoint[[measure]] <- list(
+    model = arima_model,
+    forecast = forecast_result,
+    historical_data = measure_data,
+    original_data = measure_data$val,
+    adjusted_data = measure_data$val_adjusted
+  )
+}
+
+measure_names <- c(
+  "DALYs (Disability-Adjusted Life Years)" = "01.ASDR",
+  "Incidence" = "02.ASIR", 
+  "Prevalence" = "03.ASPR"
+)
+
+# 图片编号映射
+measure_names_png <- c(
+  "DALYs (Disability-Adjusted Life Years)" = "04.ASDR",
+  "Incidence" = "05.ASIR", 
+  "Prevalence" = "06.ASPR"
+)
+
+# 生成结果
+for(measure in measures) {
+  
+  # 获取该指标的结果
+  result <- arima_results_joinpoint[[measure]]
+  hist_data <- result$historical_data
+  forecast_data <- result$forecast
+  
+  # 准备ARIMA拟合数据 (1990-2021) - 使用调整后的数据
+  arima_fitted <- data.frame(
+    year = 1990:2021,
+    value = as.numeric(fitted(result$model)),
+    type = "ARIMA拟合"
+  )
+  
+  # 准备ARIMA预测数据 (2022-2050)
+  arima_forecast <- data.frame(
+    year = 2022:2050,
+    value = as.numeric(forecast_data$mean),
+    lower95 = as.numeric(forecast_data$lower[,2]),
+    upper95 = as.numeric(forecast_data$upper[,2]),
+    lower80 = as.numeric(forecast_data$lower[,1]),
+    upper80 = as.numeric(forecast_data$upper[,1]),
+    type = "ARIMA predict"
+  )
+  
+  filename <- measure_names[measure]
+  write.csv(arima_forecast, file.path(output, paste0(filename, "_forecast.csv")), row.names = FALSE)
+  
+  # 绘图
+  p <- ggplot() +
+    # 原始历史观测值
+    geom_point(data = hist_data, aes(x = year, y = val), 
+               color = "grey", size = 0.6, alpha = 0.5) +
+    
+    # 调整后的数据 (黑线)
+    geom_line(data = hist_data, aes(x = year, y = val_adjusted), 
+              color = "black", linewidth = 0.8) +
+    
+    # LM趋势线 (绿线, 1990-2021)
+    geom_line(data = hist_data, aes(x = year, y = trend), 
+              color = "green", linewidth = 0.8) +
+    
+    # ARIMA拟合线 (蓝线, 1990-2021)
+    geom_line(data = arima_fitted, aes(x = year, y = value), 
+              color = "blue", linewidth = 0.8) +
+    
+    # ARIMA预测线 (蓝线, 2022-2050)
+    geom_line(data = arima_forecast, aes(x = year, y = value), 
+              color = "blue", linewidth = 0.8) +
+    
+    # 95%置信区间 (浅灰色)
+    geom_ribbon(data = arima_forecast, 
+                aes(x = year, ymin = lower95, ymax = upper95), 
+                fill = "lightgray", alpha = 0.6) +
+    
+    # 80%置信区间 (深蓝色)
+    geom_ribbon(data = arima_forecast, 
+                aes(x = year, ymin = lower80, ymax = upper80), 
+                fill = "blue", alpha = 0.3) +
+    
+    # 分界线
+    geom_vline(xintercept = 2021.5, linetype = "dotted", color = "gray") +
+    
+    labs(
+      title = paste("Forecasts from ARIMA:", measure),
+      x = "year",
+      y = "ASR"
+      #"黑点:原始值 | 黑线:调整值 | 绿线:线性趋势 | 蓝线:ARIMA拟合/预测"
+    ) +
+    
+    scale_x_continuous(breaks = seq(1990, 2050, 10)) +
+    theme_classic()
+  
+  # 显示图表
+  print(p)
+  
+  # 保存图表
+  ggsave(file.path(output, paste0(measure_names_png[measure], "_forecast.png")), 
+         plot = p, width = 10, height = 6, dpi = 300)
+}

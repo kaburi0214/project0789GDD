@@ -1,0 +1,452 @@
+# 当前脚本应该在01_project0789目录下，而不是在分析点目录03_ssb_gout_attribute里面
+# 清除当前环境所有变量并返回内存使用情况
+rm(list = ls()); gc()
+
+# 定义两个变量,output和ORIGINAL_DIR
+ORIGINAL_DIR <- "/data/nas1/zhangtongrui_OD/project/01_project0789"
+output <- file.path(ORIGINAL_DIR, "03_ssb_gout_attribute")
+
+# 确保输出目录存在
+if (!dir.exists(output)) {
+  dir.create(output, recursive = TRUE)
+}
+
+# 切换到项目目录下
+setwd(ORIGINAL_DIR)
+
+# 加载必要的包
+library(ggplot2)
+library(rworldmap)
+library(meta)
+library(brms)
+library(dplyr)
+library(tidyr)
+library(rworldmap)
+library(countrycode)
+library(readxl)
+
+# 设置全局随机种子以确保结果可重复
+set.seed(42)
+
+#加载贝叶斯模型
+if (file.exists(file.path(ORIGINAL_DIR, "02_ssbintk", "ssb_all_country_bm.rds"))) {
+  model_cnty <- readRDS(file.path(ORIGINAL_DIR, "02_ssbintk", "ssb_all_country_bm.rds"))
+}
+
+# 为全球PAF计算构建预测数据框（仅20岁以上）
+predict_data <- expand.grid(
+  age = factor(seq(22.5, 97.5, by = 5)),
+  gender = factor(c("Male", "Female")),
+  education = factor(c("0-6", "6-12", "≥12")),
+  residence = factor(c("Rural", "Urban")),
+  superregion = NA,
+  country = NA
+)
+
+# 获取1000个后验抽样预测
+posterior_preds <- posterior_epred(
+  model_cnty,
+  newdata = predict_data,
+  draws = 1000,
+  allow_new_levels = TRUE
+)
+
+# 处理数据，将每个draw单独缩放至10-250，以应对原始数据极端分布的问题
+posterior_long <- as.data.frame(posterior_preds) %>%
+  mutate(draw_id = 1:nrow(.)) %>%
+  pivot_longer(-draw_id, names_to = "row_id", values_to = "intake") %>%
+  mutate(
+    row_id = as.integer(gsub("V", "", row_id)), 
+    intake = exp(intake)
+  ) %>%
+  left_join(predict_data %>% mutate(row_id = row_number()), by = "row_id") %>%
+  group_by(draw_id) %>%
+  mutate(
+    intake_scaled = pmax(pmin(intake, quantile(intake, 0.9)), quantile(intake, 0.1)),
+    intake = 10 + (intake_scaled - min(intake_scaled)) / (max(intake_scaled) - min(intake_scaled)) * (250 - 10)
+  ) %>%
+  ungroup()
+
+# 计算暴露分布 Pi（6个等级）
+bins <- c(0, 25, 50, 100, 150, 200, Inf)
+posterior_long <- posterior_long %>%
+  mutate(
+    intake_level = cut(intake, breaks = bins, right = FALSE, include.lowest = TRUE,
+                       labels = paste0("level_", 1:(length(bins) - 1))),
+    group_id = paste(gender, age, education, residence, sep = "_")
+  )
+
+# 使用等权重（每层同权）
+n_groups <- posterior_long %>%
+  group_by(draw_id) %>%
+  summarise(n = n_distinct(group_id), .groups = "drop")
+
+posterior_long <- posterior_long %>%
+  left_join(n_groups, by = "draw_id") %>%
+  mutate(weight = 1 / n)
+
+# 计算每条 draw 下的分布
+pi_draws <- posterior_long %>%
+  group_by(draw_id, intake_level) %>%
+  summarise(pi = sum(weight), .groups = "drop") %>%
+  pivot_wider(names_from = intake_level, values_from = pi, values_fill = 0)
+
+# Meta分析设置RR值
+studies <- data.frame(
+  study = c("HPFS", "NHS"),
+  rr = c(1.84, 2.39),
+  lower_ci = c(1.08, 1.34),
+  upper_ci = c(3.15, 4.26)
+)
+studies$log_rr <- log(studies$rr)
+studies$se_log_rr <- (log(studies$upper_ci) - log(studies$lower_ci)) / (2 * 1.96)
+
+meta_result <- metagen(
+  TE = log_rr,
+  seTE = se_log_rr,
+  data = studies,
+  studlab = study,
+  comb.fixed = TRUE
+)
+
+RR_fixed <- exp(meta_result$TE.common) 
+RR_matrix <- matrix(1, nrow = 1000, ncol = 6)
+RR_matrix[, 6] <- RR_fixed     # 200+g: 最高风险
+
+#计算每条 draw 的 PAF
+calculate_paf <- function(pi_vec, rr_vec) {
+  sum(pi_vec * (rr_vec - 1)) / (sum(pi_vec * (rr_vec - 1)) + 1)
+}
+
+paf_draws <- mapply(
+  FUN = calculate_paf,
+  split(as.matrix(pi_draws[, -1]), seq_len(nrow(pi_draws))),
+  split(RR_matrix, seq_len(nrow(RR_matrix)))
+) %>% as.numeric()
+
+paf_summary <- tibble(paf = paf_draws) %>%
+  summarise(
+    mean_paf = mean(paf),
+    lower_ui = quantile(paf, 0.025),
+    upper_ui = quantile(paf, 0.975)
+  )
+print(paf_summary)
+
+# 从GBD数据集中提取2021年ASIR，ASPR，ASDR的点估计值
+gbd_gout_2021 <- read.csv("00_rawdata/IHME-GBD_2021_DATA-ec7daba0-1.csv")
+ASIR <- gbd_gout_2021 %>%
+  filter(
+    location_name == "Global",
+    sex_name == "Both", 
+    age_name == "Age-standardized",
+    metric_name == "Rate",
+    measure_name == "Incidence",
+    year == "2021"
+  ) %>%
+  pull(val)
+
+ASPR <- gbd_gout_2021 %>%
+  filter(
+    location_name == "Global",
+    sex_name == "Both", 
+    age_name == "Age-standardized",
+    metric_name == "Rate",
+    measure_name == "Prevalence",
+    year == "2021"
+  ) %>%
+  pull(val)
+
+ASDR <- gbd_gout_2021 %>%
+  filter(
+    location_name == "Global",
+    sex_name == "Both", 
+    age_name == "Age-standardized",
+    metric_name == "Rate",
+    measure_name == "DALYs (Disability-Adjusted Life Years)",
+    year == "2021"
+  ) %>%
+  pull(val)
+
+attributable_burden <- tibble(paf = paf_draws) %>%
+  mutate(
+    asir = paf * ASIR,
+    aspr = paf * ASPR,
+    asdr = paf * ASDR
+  )
+
+burden_summary <- attributable_burden %>%
+  summarise(
+    mean_asir = mean(asir),
+    lower_asir = quantile(asir, 0.025),
+    upper_asir = quantile(asir, 0.975),
+    
+    mean_aspr = mean(aspr),
+    lower_aspr = quantile(aspr, 0.025),
+    upper_aspr = quantile(aspr, 0.975),
+    
+    mean_asdr = mean(asdr),
+    lower_asdr = quantile(asdr, 0.025),
+    upper_asdr = quantile(asdr, 0.975)
+  )
+print(burden_summary)
+
+# 整理数据用于柱状图展示
+burden_plot_data <- attributable_burden %>%
+  mutate(draw = row_number()) %>%
+  pivot_longer(cols = c(asir, aspr, asdr), names_to = "indicator", values_to = "value") %>%
+  group_by(indicator) %>%
+  summarise(
+    mean = mean(value),
+    lower = quantile(value, 0.025),
+    upper = quantile(value, 0.975)
+  )
+
+# 替换指标名用于图中显示
+burden_plot_data$indicator <- factor(
+  burden_plot_data$indicator,
+  levels = c("asir", "aspr", "asdr"),
+  labels = c("ASIR", "ASPR", "ASDR")
+)
+
+# 绘制柱状图
+p1 <- ggplot(burden_plot_data, aes(x = indicator, y = mean)) +
+  geom_col(fill = "#1f77b4", width = 0.6) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+  labs(title = "Global burden attributable to SSBs (Gout, 2021)",
+       y = "Attributable burden (per million)",
+       x = "") +
+  theme_minimal(base_size = 14)
+
+ggsave(file.path(output, "01.SSB_burden_barplot.pdf"), p1, width = 8, height = 6)
+################################################################################
+# 读取全球185个国家SSB摄入情况的数据
+ssb_countries <- read.csv('00_rawdata/Country-level estimates/v15_cnty.csv')
+
+# 筛选并清理数据
+ssb_countries_18 <- ssb_countries %>%
+  filter(
+    year == 2018,
+    age!= 999,
+    female != 999,
+    urban != 999,
+    edu != 999,
+    !is.na(median),
+    !is.na(lowerci_95),
+    !is.na(upperci_95)
+  )
+
+# 将分类变量转换为因子
+ssb_countries_18 <- ssb_countries_18 %>%
+  mutate(
+    age = factor(age, levels = c(0.5, 1.5, 3.5, seq(7.5, 97.5, by = 5))),
+    gender = factor(female, levels = c(0, 1), labels = c("Male", "Female")),      
+    education = factor(edu, levels = c(1, 2, 3), labels = c("0-6", "6-12", "≥12")),
+    residence = factor(urban, levels = c(0, 1), labels = c("Rural", "Urban")),
+    superregion = factor(superregion2, levels = c("Asia", "FSU", "HIC", "LAC", "MENA", "SAARC", "SSA")),
+    country = factor(iso3, levels = unique(ssb_countries_18$iso3))
+  )
+
+# 利用贝叶斯模型的输出获得CRA模型暴露数据输入
+# 为185个国家生成预测数据
+predict_data_185 <- ssb_countries_18 %>%
+  distinct(superregion, country, age, gender, education, residence) %>%
+  filter(age %in% seq(22.5, 97.5, by = 5)) %>%
+  arrange(country, gender, education, residence, age)
+
+# 生成后验预测
+posterior_preds_185 <- posterior_epred(
+  model_cnty,
+  newdata = predict_data_185,
+  draws = 1000,
+  allow_new_levels = TRUE
+)
+
+# 转换数据格式
+posterior_long_185 <- as.data.frame(posterior_preds_185) %>%
+  mutate(draw_id = 1:nrow(.)) %>%
+  pivot_longer(-draw_id, names_to = "row_id", values_to = "log_intake") %>%
+  mutate(
+    row_id = as.integer(gsub("V", "", row_id)),
+    intake = exp(log_intake)
+  ) %>%
+  left_join(predict_data_185 %>% mutate(row_id = row_number()), by = "row_id")
+
+posterior_long_185 <- posterior_long_185 %>%
+  mutate(
+    intake_level = cut(intake, breaks = bins, right = FALSE, include.lowest = TRUE,
+                       labels = paste0("level_", 1:(length(bins) - 1))),
+    group_id = paste(gender, age, education, residence, sep = "_")
+  )
+
+# 计算每个国家每条draw的Pi分布
+pi_draws_by_country <- posterior_long_185 %>%
+  
+  group_by(country, draw_id) %>%
+  mutate(weight = 1 / n()) %>%
+  group_by(country, draw_id, intake_level) %>%
+  summarise(pi = sum(weight), .groups = "drop") %>%
+  pivot_wider(names_from = intake_level, values_from = pi, values_fill = 0)
+
+pi_draws_by_country <- pi_draws_by_country %>%
+  select(country, draw_id, level_1, level_2, level_3, level_4, level_5, level_6)
+
+# 为每个国家计算PAF
+countries <- unique(pi_draws_by_country$country)
+paf_results_by_country <- data.frame()
+
+for(country_name in countries) {
+  # 提取该国家的Pi数据
+  country_pi <- pi_draws_by_country %>%
+    filter(country == country_name) %>%
+    arrange(draw_id)
+  
+  # 计算PAF
+  paf_draws <- numeric(1000)
+  for(i in 1:1000) {
+    pi_vec <- as.numeric(country_pi[i, -c(1:2)])
+    rr_vec <- RR_matrix[i, ]
+    paf_draws[i] <- calculate_paf(pi_vec, rr_vec)
+  }
+  
+  # 汇总结果
+  country_result <- data.frame(
+    country = country_name,
+    mean_paf = mean(paf_draws) * 100,
+    lower_paf = quantile(paf_draws, 0.025) * 100,
+    upper_paf = quantile(paf_draws, 0.975) * 100
+  )
+  
+  paf_results_by_country <- rbind(paf_results_by_country, country_result)
+}
+
+# 查看结果
+head(paf_results_by_country, 10)
+summary(paf_results_by_country$mean_paf)
+
+# 读取GBD痛风数据
+gbd_gout <- read.csv("00_rawdata/IHME-GBD_2021_DATA-7cf7e249-1.csv")  
+
+# 筛选2021年、Both性别、年龄标准化的数据
+gbd_gout_2021 <- gbd_gout %>%
+  filter(
+    sex_name == "Both",
+    age_name == "Age-standardized"
+  )
+
+# 提取各指标数据
+asir_data <- gbd_gout_2021 %>%
+  filter(measure_name == "Incidence") %>%
+  select(location_name, val) %>%
+  rename(asir = val)
+
+aspr_data <- gbd_gout_2021 %>%
+  filter(measure_name == "Prevalence") %>%
+  select(location_name, val) %>%
+  rename(aspr = val)
+
+asdr_data <- gbd_gout_2021 %>%
+  filter(measure_name == "DALYs (Disability-Adjusted Life Years)") %>%
+  select(location_name, val) %>%
+  rename(asdr = val)
+
+# 自动映射国家名到ISO3
+asir_data$iso3 <- countrycode(asir_data$location_name, origin = "country.name", destination = "iso3c")
+aspr_data$iso3 <- countrycode(aspr_data$location_name, origin = "country.name", destination = "iso3c")
+asdr_data$iso3 <- countrycode(asdr_data$location_name, origin = "country.name", destination = "iso3c")
+
+# 读取codebook文件
+# 读取Excel文件的第2个sheet
+codebook <- read_excel("00_rawdata/GDD 2018 Codebook_Jan 10 2022.xlsx", sheet = 2)
+
+# 从codebook提取国家映射表
+country_mapping <- codebook %>%
+  select(iso3, ...2) %>%  # 第一列是国家名，第二列是ISO3代码
+  rename(location_name = iso3, iso3 = ...2) %>%  # 重命名列
+  filter(
+    !is.na(location_name), 
+    !is.na(iso3),
+    location_name != "Label",  # 移除标题行
+    iso3 != "Code"             # 移除标题行
+  ) %>%
+  distinct()  # 去重
+# 然后手动修正已知的名称差异
+country_mapping <- country_mapping %>%
+  mutate(
+    location_name = case_when(
+      iso3 == "USA" ~ "United States of America",
+      iso3 == "KOR" ~ "Republic of Korea",
+      iso3 == "PRK" ~ "Democratic People's Republic of Korea",
+      iso3 == "CZE" ~ "Czechia",
+      iso3 == "TWN" ~ "Taiwan (Province of China)",
+      iso3 == "RUS" ~ "Russian Federation",
+      iso3 == "IRN" ~ "Iran (Islamic Republic of)",
+      iso3 == "VEN" ~ "Venezuela (Bolivarian Republic of)",
+      iso3 == "BOL" ~ "Bolivia (Plurinational State of)",
+      iso3 == "TZA" ~ "United Republic of Tanzania",
+      iso3 == "SYR" ~ "Syrian Arab Republic",
+      iso3 == "LAO" ~ "Lao People's Democratic Republic",
+      iso3 == "MDA" ~ "Republic of Moldova",
+      iso3 == "BRN" ~ "Brunei Darussalam",
+      iso3 == "FSM" ~ "Micronesia (Federated States of)",
+      TRUE ~ location_name
+    )
+  )
+# 合并数据
+country_burden_data <- asir_data %>%
+  full_join(aspr_data, by = "iso3", suffix = c(".asir", ".aspr")) %>%
+  full_join(asdr_data, by = "iso3") %>%
+  left_join(country_mapping, by = "iso3") %>%
+  filter(!is.na(iso3))
+
+# 基于PAF的185个国家进行映射和合并
+attributable_burden_countries <- paf_results_by_country %>%
+  left_join(country_mapping, by = c("country" = "iso3")) %>%  # 匹配国家名
+  left_join(asir_data, by = "location_name") %>%              # 合并ASIR
+  left_join(aspr_data, by = "location_name") %>%              # 合并ASPR  
+  left_join(asdr_data, by = "location_name") %>%              # 合并ASDR
+  filter(!is.na(location_name), !is.na(asir)) %>%            # 只保留有完整数据的国家
+  mutate(
+    # 计算归因负担（每百万人）
+    asir_attributable = (mean_paf/100) * asir * 10,
+    aspr_attributable = (mean_paf/100) * aspr * 10,
+    asdr_attributable = (mean_paf/100) * asdr * 10
+  )
+
+# 准备地图数据
+map_data <- attributable_burden_countries
+names(map_data)[1] <- "ISO3"
+mapped_data <- joinCountryData2Map(map_data, joinCode = "ISO3", nameJoinColumn = "ISO3")
+
+# 生成3张世界地图
+# 1. ASIR归因负担地图
+pdf(file.path(output, "02.ASIR_attributable_map.pdf"), width = 14, height = 10)
+mapCountryData(mapped_data, 
+               nameColumnToPlot = "asir_attributable",
+               catMethod = "pretty", numCats = 7, colourPalette = "heat",
+               oceanCol = "lightblue", missingCountryCol = "grey90",
+               mapTitle = "ASIR Attributable to SSBs (per 1,000,000)")
+dev.off()
+
+# 2. ASPR归因负担地图
+pdf(file.path(output, "03.ASPR_attributable_map.pdf"), width = 14, height = 10)
+mapCountryData(mapped_data, 
+               nameColumnToPlot = "aspr_attributable",
+               catMethod = "pretty", numCats = 7, colourPalette = "heat",
+               oceanCol = "lightblue", missingCountryCol = "grey90",
+               mapTitle = "ASPR Attributable to SSBs (per 1,000,000)")
+dev.off()
+
+# 3. ASDR归因负担地图
+pdf(file.path(output, "04.ASDR_attributable_map.pdf"), width = 14, height = 10)
+mapCountryData(mapped_data, 
+               nameColumnToPlot = "asdr_attributable",
+               catMethod = "pretty", numCats = 7, colourPalette = "heat",
+               oceanCol = "lightblue", missingCountryCol = "grey90",
+               mapTitle = "ASDR Attributable to SSBs (per 1,000,000)")
+dev.off()
+
+
+
+
+
+
