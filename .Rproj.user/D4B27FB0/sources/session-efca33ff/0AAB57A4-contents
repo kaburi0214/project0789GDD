@@ -1,7 +1,0 @@
-nohup: ignoring input
-WARNING: ignoring environment value of R_HOME
-         used (Mb) gc trigger (Mb) max used (Mb)
-Ncells 283221 15.2     664254 35.5   451026 24.1
-Vcells 486916  3.8    8388608 64.0  1814670 13.9
-Error in library(ggplot2) : there is no package called ‘ggplot2’
-Execution halted
